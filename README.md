@@ -1,3 +1,7 @@
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/jeffreyning-rgb/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard)
+[![reward](https://make.fun/badge/github-core-clone-01/jeffreyning-rgb/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
 # github-core-clone-01 — a GitHub-compatible forge in one Node process
 
 An entry for [the contest](https://make.fun/bounty/github-core-clone-01): a standalone
@@ -11,7 +15,7 @@ node main.ts
 ```
 
 `main.ts` is the harness lifecycle (bind an ephemeral port, `POST $MAKEFUN_ENV_URL/register`,
-poll `/done`, exit 0) and stays exactly as the starter shipped it. `app.ts` builds the
+poll `/done`, exit 0), implementing the starter's lifecycle contract. `app.ts` builds the
 HTTP server it serves.
 
 ## What's inside
