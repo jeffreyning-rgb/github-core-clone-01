@@ -149,16 +149,33 @@ interface FetchPlan {
   unshallow: string[];
 }
 
+/**
+ * Ancestor sets are memoized per commit oid. Stored objects are immutable and
+ * content-addressed, so a commit's ancestry can never change once computed.
+ * Push-heavy flows ask "is the old tip an ancestor of the new one?" after every
+ * push; without the memo each answer re-walks (and re-parses) the whole chain,
+ * which makes a run of chained pushes quadratic in the history length.
+ */
+const ancestorMemo = new Map<string, Set<string>>();
+
+function ancestorsOf(store: Store, tip: string): Set<string> {
+  const hit = ancestorMemo.get(tip);
+  if (hit) return hit;
+  const obj = store.objects.get(tip);
+  if (!obj || obj.type !== 'commit') return new Set();
+  const set = new Set<string>([tip]);
+  for (const p of parseCommit(obj.data).parents) {
+    for (const a of ancestorsOf(store, p)) set.add(a);
+  }
+  if (ancestorMemo.size > 8192) ancestorMemo.clear();
+  ancestorMemo.set(tip, set);
+  return set;
+}
+
 function reachableCommits(store: Store, tips: string[]): Set<string> {
   const out = new Set<string>();
-  const queue = [...tips];
-  while (queue.length > 0) {
-    const oid = queue.pop() as string;
-    if (out.has(oid)) continue;
-    const obj = store.objects.get(oid);
-    if (!obj || obj.type !== 'commit') continue;
-    out.add(oid);
-    for (const p of parseCommit(obj.data).parents) queue.push(p);
+  for (const tip of tips) {
+    for (const oid of ancestorsOf(store, tip)) out.add(oid);
   }
   return out;
 }
@@ -285,6 +302,45 @@ function cachedPack(repoName: string, plan: FetchPlan, keyParts: string[]): Buff
   return pack;
 }
 
+/**
+ * Whole-response cache for fetch. A fetch answer is a pure function of the
+ * wants/haves/shallow/deepen it names: the object graph behind those oids is
+ * immutable, and refs play no part once the want oids are pinned. Clone-heavy
+ * flows (dozens of concurrent clones of one tip) all ask for exactly the same
+ * fetch, so they share one computed answer instead of re-planning and
+ * re-packing it per request. The key records which of the named oids actually
+ * exist, so an oid that appears later (pushed after an earlier fetch named it
+ * as a have) keys differently and can never be served the stale answer.
+ */
+const fetchResponseCache = new Map<string, Buffer>();
+
+function fetchCacheKey(
+  store: Store,
+  repoName: string,
+  variant: string,
+  wants: string[],
+  haves: string[],
+  shallow: string[],
+  deepen: number | null,
+  extra: string,
+): string {
+  const existing = (list: string[]): string => list.filter((o) => store.objects.has(o)).sort().join(',');
+  const shallowKey = shallow.map((o) => `${o}:${store.objects.has(o) ? 1 : 0}`).sort().join(',');
+  return [repoName, variant, existing(wants), existing(haves), shallowKey, String(deepen), extra].join('|');
+}
+
+function fetchCached(key: string): Buffer | undefined {
+  return fetchResponseCache.get(key);
+}
+
+function fetchStore(key: string, body: Buffer): Buffer {
+  if (body.length <= 4 * 1024 * 1024) {
+    if (fetchResponseCache.size > 128) fetchResponseCache.clear();
+    fetchResponseCache.set(key, body);
+  }
+  return body;
+}
+
 function sidebandPackets(data: Buffer): Buffer[] {
   const out: Buffer[] = [];
   const CHUNK = 32768;
@@ -312,6 +368,9 @@ function fetchV2(ctx: GitHttpContext, repo: RepoRec, args: string[]): HttpResult
     else if (arg === 'done') done = true;
   }
   const validWants = wants.filter((w) => store.objects.has(w));
+  const cacheKey = fetchCacheKey(store, repo.name, 'v2', wants, haves, clientShallow, deepen, done ? 'done' : 'ack');
+  const hit = fetchCached(cacheKey);
+  if (hit) return binary(200, hit, 'application/x-git-upload-pack-result');
   const plan = planFetch(store, validWants, haves, clientShallow, deepen);
 
   const parts: Buffer[] = [];
@@ -320,7 +379,7 @@ function fetchV2(ctx: GitHttpContext, repo: RepoRec, args: string[]): HttpResult
     const ack = haves.find((h) => store.objects.has(h));
     parts.push(encodePktLine(Buffer.from(ack ? `ACK ${ack}\n` : 'NAK\n', 'utf8')));
     parts.push(pktFlush());
-    return binary(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+    return binary(200, fetchStore(cacheKey, Buffer.concat(parts)), 'application/x-git-upload-pack-result');
   }
   parts.push(encodePktLine(Buffer.from(plan.objects.length > 0 ? 'ready\n' : 'NAK\n', 'utf8')));
   parts.push(pktDelim());
@@ -334,7 +393,7 @@ function fetchV2(ctx: GitHttpContext, repo: RepoRec, args: string[]): HttpResult
   const pack = cachedPack(repo.name, plan, [...validWants, 'h', ...haves, 's', ...clientShallow, 'd', String(deepen)]);
   parts.push(...sidebandPackets(pack));
   parts.push(pktFlush());
-  return binary(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  return binary(200, fetchStore(cacheKey, Buffer.concat(parts)), 'application/x-git-upload-pack-result');
 }
 
 function fetchV0(ctx: GitHttpContext, repo: RepoRec, body: Buffer): HttpResult {
@@ -356,6 +415,9 @@ function fetchV0(ctx: GitHttpContext, repo: RepoRec, body: Buffer): HttpResult {
     else if (line.startsWith('deepen ')) deepen = Number(line.slice(7).trim()) || null;
   }
   const validWants = wants.filter((w) => store.objects.has(w));
+  const cacheKey = fetchCacheKey(store, repo.name, 'v0', wants, haves, clientShallow, deepen, '');
+  const hit = fetchCached(cacheKey);
+  if (hit) return binary(200, hit, 'application/x-git-upload-pack-result');
   const plan = planFetch(store, validWants, haves, clientShallow, deepen);
   const parts: Buffer[] = [];
   for (const oid of plan.shallow) parts.push(encodePktLine(Buffer.from(`shallow ${oid}\n`, 'utf8')));
@@ -364,7 +426,7 @@ function fetchV0(ctx: GitHttpContext, repo: RepoRec, body: Buffer): HttpResult {
   const pack = cachedPack(repo.name, plan, [...validWants, 'h', ...haves, 's', ...clientShallow, 'd', String(deepen)]);
   parts.push(...sidebandPackets(pack));
   parts.push(pktFlush());
-  return binary(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  return binary(200, fetchStore(cacheKey, Buffer.concat(parts)), 'application/x-git-upload-pack-result');
 }
 
 function uploadPack(ctx: GitHttpContext, repo: RepoRec): HttpResult {

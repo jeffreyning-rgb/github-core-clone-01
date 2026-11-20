@@ -14,10 +14,14 @@ import { handleMcp } from './mcp.ts';
 
 const store = new Store();
 let requestSeq = 0;
+// One random suffix per process, reused by every request id: the sequence
+// number keeps ids unique, and skipping a fresh randomBytes call per response
+// keeps the hot request path free of that syscall.
+const REQUEST_ID_SUFFIX = randomBytes(6).toString('hex').toUpperCase();
 
 function requestId(): string {
   requestSeq += 1;
-  return `${requestSeq.toString(16).padStart(4, '0')}:${randomBytes(6).toString('hex').toUpperCase()}`;
+  return `${requestSeq.toString(16).padStart(4, '0')}:${REQUEST_ID_SUFFIX}`;
 }
 
 const NOT_FOUND: HttpResult = { status: 404, body: { message: 'Not Found' } };
